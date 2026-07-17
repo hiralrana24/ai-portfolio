@@ -5,7 +5,13 @@ import json
 import pandas as pd
 from mistralai.client import Mistral
 
-# Your API key
+# Page config
+st.set_page_config(
+    page_title="Hotel Invoice Extractor",
+    page_icon="🏨",
+    layout="wide"
+)
+
 API_KEY = "s46f3EZ1Up9LrY0INTDQ8wyGMSYggC05"
 
 def extract_image_from_pdf(pdf_bytes, zoom=3):
@@ -50,40 +56,68 @@ def save_to_excel(data, output_path="invoices_output.xlsx"):
     final_df.to_excel(output_path, index=False)
     return final_df
 
-# --- STREAMLIT INTERFACE ---
+# --- INTERFACE ---
 st.title("🏨 Hotel Invoice Extractor")
-st.write("Upload an invoice PDF and let AI extract the data automatically!")
+st.markdown("**Automate your invoice processing with AI — upload a PDF and get structured data instantly.**")
+st.divider()
 
-uploaded_file = st.file_uploader("Upload your invoice (PDF)", type="pdf")
+col1, col2 = st.columns([1, 1])
 
-if uploaded_file:
-    st.info("Processing your invoice...")
-    
-    pdf_bytes = uploaded_file.read()
-    image_bytes = extract_image_from_pdf(pdf_bytes)
-    
-    st.image(image_bytes, caption="Invoice preview", width=400)
-    
-    with st.spinner("AI is reading your invoice..."):
-        data = extract_invoice_data(image_bytes, API_KEY)
-    
-    st.success("✅ Data extracted successfully!")
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total HT", f"{data['total_ht']}€")
-    col2.metric("Total TVA", f"{data['total_tva']}€")
-    col3.metric("Total TTC", f"{data['total_ttc']}€")
-    
-    st.write("### Invoice Details")
-    st.json(data)
-    
-    df = save_to_excel(data)
-    st.write("### All Invoices")
-    st.dataframe(df)
-    
-    st.download_button(
-        label="📥 Download Excel",
-        data=open("invoices_output.xlsx", "rb").read(),
-        file_name="invoices_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+with col1:
+    st.subheader("📄 Upload Invoice")
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+
+    if uploaded_file:
+        st.success(f"✅ File uploaded: {uploaded_file.name}")
+        pdf_bytes = uploaded_file.read()
+        image_bytes = extract_image_from_pdf(pdf_bytes)
+        st.image(image_bytes, caption="Invoice Preview", use_column_width=True)
+
+with col2:
+    if uploaded_file:
+        st.subheader("🤖 AI Extraction")
+
+        if st.button("Extract Data", type="primary", use_container_width=True):
+            try:
+                with st.spinner("AI is reading your invoice..."):
+                    data = extract_invoice_data(image_bytes, API_KEY)
+
+                st.success("✅ Data extracted successfully!")
+                st.divider()
+
+                # Metrics
+                st.subheader("💰 Invoice Summary")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total HT", f"{data['total_ht']}€")
+                m2.metric("TVA", f"{data['total_tva']}€")
+                m3.metric("Total TTC", f"{data['total_ttc']}€")
+
+                st.divider()
+
+                # Details
+                st.subheader("📋 Invoice Details")
+                st.write(f"**Invoice Number :** {data['invoice_number']}")
+                st.write(f"**Date :** {data['date']}")
+                st.write(f"**Supplier :** {data['supplier']}")
+
+                # Save to Excel
+                df = save_to_excel(data)
+                st.divider()
+
+                # Table
+                st.subheader("📊 All Invoices")
+                st.dataframe(df, use_container_width=True)
+
+                # Download
+                with open("invoices_output.xlsx", "rb") as f:
+                    st.download_button(
+                        label="📥 Download Excel Report",
+                        data=f.read(),
+                        file_name="invoices_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.info("Please check your API key and try again.")
