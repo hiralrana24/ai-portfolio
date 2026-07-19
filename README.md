@@ -1,37 +1,39 @@
-# 🏨 Hotel Invoice Extractor
+# 🤖 AI Portfolio — Hiral Rana
+
+> CS Student | S&OP Analyst at Safran | Building real-world AI applications
+
+---
+
+## 🚀 Projects
+
+### 🏨 [Hotel Invoice Extractor](./hotel-invoice-extracto/)
 
 > AI-powered tool that automatically extracts data from hotel invoices and exports to Excel.
 
-## 🎯 Problem Solved
+- **Problem:** Hotel staff spend hours manually entering invoice data
+- **Solution:** Upload a PDF → AI reads it → Excel downloaded automatically
+- **Stack:** Mistral Pixtral, PyMuPDF, Pandas, Streamlit
 
-Hotel and restaurant staff spend hours manually entering invoice data into Excel spreadsheets. This tool automates the entire process in seconds.
+---
 
-## 🚀 Demo
+### 🏭 [S&OP RAG Assistant](./sop-rag-assistant/)
 
-Upload a PDF invoice → AI reads it → Data extracted → Excel downloaded automatically.
+> AI assistant that answers questions about industrial capacity and workload data in natural language.
 
-## 🛠️ Tech Stack
+- **Problem:** S&OP analysts spend hours searching Excel files for capacity data
+- **Solution:** Ask a question → RAG finds relevant data → Instant precise answer
+- **Stack:** Mistral AI, Sentence Transformers, FAISS, Streamlit
 
-- **Python** — Core language
-- **Mistral AI (Pixtral)** — Vision AI for reading scanned invoices
-- **PyMuPDF** — PDF to image conversion
-- **Pandas + OpenPyXL** — Excel export
-- **Streamlit** — Web interface
+---
 
-## ⚙️ How It Works
+## 🛠️ Skills
 
-1. User uploads a PDF invoice (even scanned/image-based)
-2. PyMuPDF converts the PDF page to a high-resolution image
-3. Mistral Pixtral (Vision AI) reads the invoice and extracts structured data
-4. Data is saved to Excel automatically
-5. User downloads the Excel report
+- **AI/ML:** LLMs, RAG, Vision AI, Prompt Engineering, Vector Embeddings
+- **Tools:** Python, Pandas, FAISS, LangChain, Streamlit
+- **Domain:** S&OP, Supply Chain, Industrial Data Analysis
 
-## 📦 Installation
+## 👩‍💻 About Me
 
-```bash
-git clone https://github.com/hiralrana24/ai-portfolio
-cd ai-portfolio
-python3 -m venv venv
-source venv/bin/activate
-pip install streamlit pymupdf mistralai pandas openpyxl
-```
+CS Student in France with 2 years experience as S&OP Analyst at Safran (aerospace). Passionate about applying AI to solve real industrial problems. Targeting MSc in AI/Data Science.
+
+[GitHub](https://github.com/hiralrana24) | [LinkedIn](#)
