@@ -127,6 +127,76 @@ N'invente aucune donnée. Si une information n'est pas visible, mets une chaîne
     return json.loads(clean)
 
 
+def extract_pdf_page_images(pdf_bytes, zoom=2):
+    """Convertit toutes les pages d'un PDF en images PNG (pour les relevés multi-pages)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    for page in doc:
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        images.append(pix.tobytes("png"))
+    return images
+
+
+def extract_bank_transactions_from_page(image_bytes, api_key):
+    """
+    Analyse une page de relevé de compte bancaire et retourne la liste des
+    transactions DEBIT de type CB / VIREMENT / PRELEVEMENT (hors commissions).
+    """
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    client = Mistral(api_key=api_key)
+
+    prompt = """Tu es un assistant comptable. Voici une page d'un relevé de compte bancaire.
+Le tableau a 5 colonnes : DATE COMPTABLE, NATURE DES OPERATIONS, DATE DE VALEUR, DEBIT, CREDIT.
+
+Extrait UNIQUEMENT les lignes qui remplissent TOUTES ces conditions :
+1. Le montant se trouve dans la colonne DEBIT (jamais CREDIT).
+2. La nature de l'opération correspond à l'un de ces 3 types :
+   - CB : paiement par carte bancaire (ex: "FACTURE CARTE DU ...")
+   - VIREMENT : virement SEPA émis (ex: "VIREMENT SEPA EMIS ...")
+   - PRELEVEMENT : prélèvement SEPA (ex: "PRLV SEPA ...")
+3. Exclut TOUTES les lignes de commissions, frais, intérêts (ex: "COMMISSIONS PERCUES...", "INTERETS ET COMMISSIONS", "COMMISSIONS FACTURE...") et toute ligne de remboursement (ex: "REMB. FACT...") ou toute ligne qui ne correspond à aucun des 3 types ci-dessus.
+
+Réponds STRICTEMENT en JSON, sous forme de liste, sans aucun texte autour :
+[
+  {
+    "date": "JJ/MM/AAAA",
+    "description": "résumé court (bénéficiaire ou motif de l'opération)",
+    "montant": 0.0,
+    "type": "CB" ou "VIREMENT" ou "PRELEVEMENT",
+    "categorie": "Restaurant" ou "Salaire" ou "Divers"
+  }
+]
+
+Si aucune ligne ne correspond sur cette page, réponds exactement : []
+
+Règles pour "categorie" :
+- "Restaurant" : fournisseurs alimentaires, boissons, matériel de cuisine (ex: Sysco, Cafés Folliet, Metro)
+- "Salaire" : tout ce qui mentionne un salaire ou des charges sociales de personnel
+- "Divers" : tout le reste (énergie, assurances, impôts, abonnements, travaux, maintenance, etc.)
+
+N'invente aucune donnée."""
+
+    response = client.chat.complete(
+        model="pixtral-12b-2409",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": f"data:image/png;base64,{base64_image}"},
+                ],
+            }
+        ],
+    )
+    raw = response.choices[0].message.content
+    clean = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return []
+
+
 # ============================================================
 # ECRITURE DANS LE TEMPLATE EXCEL (préserve la mise en forme .xls)
 # ============================================================
@@ -257,7 +327,6 @@ def insert_invoice_into_workbook(template_bytes, data):
 # INTERFACE
 # ============================================================
 st.title("🏨 Hotel Invoice Extractor")
-st.markdown("**Upload ton template Excel, puis tes factures — l'IA remplit tout automatiquement.**")
 st.divider()
 
 if "master_bytes" not in st.session_state:
@@ -265,18 +334,21 @@ if "master_bytes" not in st.session_state:
     st.session_state.master_name = None
 if "log" not in st.session_state:
     st.session_state.log = []
+if "bank_log" not in st.session_state:
+    st.session_state.bank_log = []
 
 with st.sidebar:
     st.subheader("📁 Ton fichier de facturation")
     template_file = st.file_uploader("Uploade ton .xls (une seule fois)", type=["xls"])
     # On ne (re)charge le template QUE s'il s'agit d'un nouveau fichier,
-    # sinon chaque rerun de l'app (ex: clic sur "Extraire et remplir")
-    # écraserait la progression déjà faite avec la version vierge.
+    # sinon chaque rerun de l'app (ex: clic sur un bouton) écraserait
+    # la progression déjà faite avec la version vierge.
     if template_file is not None and template_file.name != st.session_state.get("uploaded_template_name"):
         st.session_state.master_bytes = template_file.read()
         st.session_state.master_name = template_file.name
         st.session_state.uploaded_template_name = template_file.name
-        st.session_state.log = []  # on repart de zéro sur un nouveau template
+        st.session_state.log = []
+        st.session_state.bank_log = []
         st.success(f"Chargé : {template_file.name}")
     elif st.session_state.master_bytes:
         st.caption(f"Fichier en cours : {st.session_state.master_name}")
@@ -291,57 +363,149 @@ with st.sidebar:
             use_container_width=True,
         )
 
-col1, col2 = st.columns([1, 1])
+tab_factures, tab_releve = st.tabs(["📄 Factures", "🏦 Relevé bancaire"])
 
-with col1:
-    st.subheader("📄 Upload Invoice(s)")
-    uploaded_files = st.file_uploader(
-        "Choisis une ou plusieurs factures PDF", type="pdf", accept_multiple_files=True
-    )
+# ------------------------------------------------------------
+# ONGLET 1 : FACTURES
+# ------------------------------------------------------------
+with tab_factures:
+    st.markdown("**Upload tes factures — l'IA remplit le tableau automatiquement.**")
+    col1, col2 = st.columns([1, 1])
 
-with col2:
-    st.subheader("🤖 Extraction & remplissage")
+    with col1:
+        st.subheader("📄 Upload Invoice(s)")
+        uploaded_files = st.file_uploader(
+            "Choisis une ou plusieurs factures PDF", type="pdf", accept_multiple_files=True, key="invoice_uploader"
+        )
 
-    if not st.session_state.master_bytes:
-        st.info("⬅️ Uploade d'abord ton template Excel dans la barre latérale.")
-    elif not uploaded_files:
-        st.info("Uploade une facture pour commencer.")
-    else:
-        if st.button("Extraire et remplir", type="primary", use_container_width=True):
-            for f in uploaded_files:
-                with st.spinner(f"Lecture de {f.name}..."):
-                    try:
-                        pdf_bytes = f.read()
-                        image_bytes = extract_image_from_pdf(pdf_bytes)
-                        data = extract_invoice_data(image_bytes, API_KEY)
-                        new_bytes, msg = insert_invoice_into_workbook(
-                            st.session_state.master_bytes, data
-                        )
-                        st.session_state.master_bytes = new_bytes
-                        st.session_state.log.append({"fichier": f.name, "data": data, "statut": msg})
-                    except Exception as e:
-                        st.session_state.log.append(
-                            {"fichier": f.name, "data": None, "statut": f"❌ Erreur : {e}"}
-                        )
+    with col2:
+        st.subheader("🤖 Extraction & remplissage")
 
-        if st.session_state.log:
-            st.divider()
-            for entry in reversed(st.session_state.log):
-                st.markdown(f"**{entry['fichier']}**")
-                st.write(entry["statut"])
-                if entry["data"]:
-                    d = entry["data"]
-                    st.caption(
-                        f"{d.get('fournisseur','?')} — {d.get('date','?')} — "
-                        f"{d.get('total_ttc','?')}€ TTC — {d.get('categorie','?')}"
-                    )
+        if not st.session_state.master_bytes:
+            st.info("⬅️ Uploade d'abord ton template Excel dans la barre latérale.")
+        elif not uploaded_files:
+            st.info("Uploade une facture pour commencer.")
+        else:
+            if st.button("Extraire et remplir", type="primary", use_container_width=True, key="btn_factures"):
+                for f in uploaded_files:
+                    with st.spinner(f"Lecture de {f.name}..."):
+                        try:
+                            pdf_bytes = f.read()
+                            image_bytes = extract_image_from_pdf(pdf_bytes)
+                            data = extract_invoice_data(image_bytes, API_KEY)
+                            new_bytes, msg = insert_invoice_into_workbook(
+                                st.session_state.master_bytes, data
+                            )
+                            st.session_state.master_bytes = new_bytes
+                            st.session_state.log.append({"fichier": f.name, "data": data, "statut": msg})
+                        except Exception as e:
+                            st.session_state.log.append(
+                                {"fichier": f.name, "data": None, "statut": f"❌ Erreur : {e}"}
+                            )
+
+            if st.session_state.log:
                 st.divider()
+                for entry in reversed(st.session_state.log):
+                    st.markdown(f"**{entry['fichier']}**")
+                    st.write(entry["statut"])
+                    if entry["data"]:
+                        d = entry["data"]
+                        st.caption(
+                            f"{d.get('fournisseur','?')} — {d.get('date','?')} — "
+                            f"{d.get('total_ttc','?')}€ TTC — {d.get('categorie','?')}"
+                        )
+                    st.divider()
 
-            st.download_button(
-                "📥 Télécharger le fichier mis à jour",
-                data=st.session_state.master_bytes,
-                file_name=st.session_state.master_name or "facturation_mise_a_jour.xls",
-                mime="application/vnd.ms-excel",
-                use_container_width=True,
-                key="download_bottom",
-            )
+                st.download_button(
+                    "📥 Télécharger le fichier mis à jour",
+                    data=st.session_state.master_bytes,
+                    file_name=st.session_state.master_name or "facturation_mise_a_jour.xls",
+                    mime="application/vnd.ms-excel",
+                    use_container_width=True,
+                    key="download_factures",
+                )
+
+# ------------------------------------------------------------
+# ONGLET 2 : RELEVÉ BANCAIRE
+# ------------------------------------------------------------
+with tab_releve:
+    st.markdown(
+        "**Upload un relevé de compte — l'IA extrait les lignes DEBIT de type "
+        "CB / VIREMENT / PRELEVEMENT (hors commissions) et les ajoute au tableau.**"
+    )
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("🏦 Upload relevé bancaire")
+        bank_file = st.file_uploader(
+            "Choisis un relevé de compte PDF", type="pdf", key="bank_uploader"
+        )
+
+    with col2:
+        st.subheader("🤖 Extraction & remplissage")
+
+        if not st.session_state.master_bytes:
+            st.info("⬅️ Uploade d'abord ton template Excel dans la barre latérale.")
+        elif not bank_file:
+            st.info("Uploade un relevé bancaire pour commencer.")
+        else:
+            if st.button("Extraire et remplir", type="primary", use_container_width=True, key="btn_releve"):
+                pdf_bytes = bank_file.read()
+                with st.spinner("Découpage du relevé en pages..."):
+                    page_images = extract_pdf_page_images(pdf_bytes)
+
+                all_transactions = []
+                progress = st.progress(0.0)
+                for i, img in enumerate(page_images):
+                    with st.spinner(f"Analyse de la page {i + 1}/{len(page_images)}..."):
+                        try:
+                            transactions = extract_bank_transactions_from_page(img, API_KEY)
+                            all_transactions.extend(transactions or [])
+                        except Exception as e:
+                            st.session_state.bank_log.append(
+                                {"fichier": f"{bank_file.name} (page {i + 1})", "data": None, "statut": f"❌ Erreur : {e}"}
+                            )
+                    progress.progress((i + 1) / len(page_images))
+
+                for t in all_transactions:
+                    data = {
+                        "fournisseur": t.get("description", ""),
+                        "date": t.get("date", ""),
+                        "type_paiement": t.get("type", ""),
+                        "n_cheque": "",
+                        "total_ht": 0.0,
+                        "total_tva": 0.0,
+                        "total_ttc": t.get("montant", 0.0),
+                        "categorie": t.get("categorie", "Divers"),
+                    }
+                    try:
+                        new_bytes, msg = insert_invoice_into_workbook(st.session_state.master_bytes, data)
+                        st.session_state.master_bytes = new_bytes
+                        st.session_state.bank_log.append({"fichier": bank_file.name, "data": data, "statut": msg})
+                    except Exception as e:
+                        st.session_state.bank_log.append(
+                            {"fichier": bank_file.name, "data": data, "statut": f"❌ Erreur : {e}"}
+                        )
+
+                st.success(f"Terminé : {len(all_transactions)} transaction(s) trouvée(s) sur {len(page_images)} page(s).")
+
+            if st.session_state.bank_log:
+                st.divider()
+                for entry in reversed(st.session_state.bank_log):
+                    st.write(entry["statut"])
+                    if entry["data"]:
+                        d = entry["data"]
+                        st.caption(
+                            f"{d.get('fournisseur','?')} — {d.get('date','?')} — "
+                            f"{d.get('total_ttc','?')}€ — {d.get('type_paiement','?')} — {d.get('categorie','?')}"
+                        )
+                    st.divider()
+
+                st.download_button(
+                    "📥 Télécharger le fichier mis à jour",
+                    data=st.session_state.master_bytes,
+                    file_name=st.session_state.master_name or "facturation_mise_a_jour.xls",
+                    mime="application/vnd.ms-excel",
+                    use_container_width=True,
+                    key="download_releve",
+                )
