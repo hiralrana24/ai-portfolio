@@ -2,18 +2,79 @@ import streamlit as st
 import fitz
 import base64
 import json
-import pandas as pd
+import io
+import re
+from datetime import datetime
 from mistralai.client import Mistral
+import xlrd
+from xlutils.copy import copy as xl_copy
 
-# Page config
+# ============================================================
+# CONFIG
+# ============================================================
 st.set_page_config(
     page_title="Hotel Invoice Extractor",
     page_icon="🏨",
     layout="wide"
 )
 
-API_KEY = "s46f3EZ1Up9LrY0INTDQ8wyGMSYggC05"
+API_KEY = st.secrets["MISTRAL_API_KEY"]
 
+# Onglets disponibles dans le template (noms exacts des feuilles Excel)
+MONTH_SHEET_MAP = {
+    1: None,       # Janvier - pas d'onglet dans ce template
+    2: None,       # Février - pas d'onglet dans ce template
+    3: "Mars",
+    4: "Avril",
+    5: "Mai",
+    6: "Juin",
+    7: "Jul",
+    8: "Aout",
+    9: "Sept",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
+# Chaque bloc de paiement : (ligne d'en-tête du bloc, première ligne de donnée, dernière ligne de donnée) - 0-indexé
+PAYMENT_BLOCKS = {
+    "PRELEVEMENT": (2, 3, 31),
+    "CHEQUES": (32, 33, 64),
+    "CB": (65, 66, 98),
+}
+
+# Espèces et virement n'ont pas de bloc dédié dans ce template -> routés par défaut.
+# Modifiable ici si besoin.
+PAYMENT_TYPE_TO_BLOCK = {
+    "PRELEVEMENT": "PRELEVEMENT",
+    "PRÉLÈVEMENT": "PRELEVEMENT",
+    "VIREMENT": "PRELEVEMENT",         # pas de bloc dédié -> défaut PRELEVEMENT
+    "VIREMENT BANCAIRE": "PRELEVEMENT",
+    "CHEQUE": "CHEQUES",
+    "CHÈQUE": "CHEQUES",
+    "CHEQUES": "CHEQUES",
+    "CB": "CB",
+    "CARTE": "CB",
+    "CARTE BANCAIRE": "CB",
+    "ESPECES": "CB",   # pas de bloc dédié -> défaut CB
+    "ESPÈCES": "CB",
+    "CASH": "CB",
+}
+
+# Colonnes du tableau (0-indexé, colonne 0 = marge vide)
+COL_FOURNISSEUR = 1
+COL_DATE = 2
+COL_TYPE_PAIEMENT = 3
+COL_N_CHEQUE = 4
+COL_HT = 5
+COL_TVA = 6
+COL_TTC = 7
+COL_CATEGORIE = {"Restaurant": 8, "Salaire": 9, "Divers": 10}
+
+
+# ============================================================
+# EXTRACTION IA
+# ============================================================
 def extract_image_from_pdf(pdf_bytes, zoom=3):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
@@ -21,103 +82,268 @@ def extract_image_from_pdf(pdf_bytes, zoom=3):
     pix = page.get_pixmap(matrix=mat)
     return pix.tobytes("png")
 
+
 def extract_invoice_data(image_bytes, api_key):
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
     client = Mistral(api_key=api_key)
+
+    prompt = """Tu es un assistant comptable pour un hôtel en France. Analyse cette facture et extrait UNIQUEMENT les données visibles.
+
+Réponds STRICTEMENT en JSON avec ce format exact, sans aucun texte autour :
+{
+  "fournisseur": "nom du fournisseur",
+  "date": "JJ/MM/AAAA",
+  "type_paiement": "PRELEVEMENT" ou "CHEQUE" ou "CB" ou "ESPECES",
+  "n_cheque": "numéro de chèque si visible, sinon chaîne vide",
+  "total_ht": 0.0,
+  "total_tva": 0.0,
+  "total_ttc": 0.0,
+  "categorie": "Restaurant" ou "Salaire" ou "Divers"
+}
+
+Règles pour "type_paiement" : regarde la case cochée dans "MODE DE RÈGLEMENT" (CHEQUE, CB, ESPECES) ou déduis PRELEVEMENT si c'est un prélèvement automatique (loyer, abonnement, assurance).
+
+Règles pour "categorie" (classification comptable, très important) :
+- "Restaurant" : produits alimentaires, boissons, matériel de cuisine, fournisseurs de restauration (ex: Sysco, Metro, Pomona, boucherie, primeur)
+- "Salaire" : tout ce qui concerne le personnel, paie, charges sociales, intérim
+- "Divers" : tout le reste (fournitures, entretien, énergie, assurance, travaux, etc.)
+
+N'invente aucune donnée. Si une information n'est pas visible, mets une chaîne vide "" ou 0.0."""
+
     response = client.chat.complete(
         model="pixtral-12b-2409",
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": "Extract ONLY visible data from this invoice. Respond ONLY in JSON: {\"invoice_number\": \"\", \"date\": \"\", \"supplier\": \"\", \"total_ht\": 0.0, \"total_tva\": 0.0, \"total_ttc\": 0.0}"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/png;base64,{base64_image}"
-                    }
-                ]
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": f"data:image/png;base64,{base64_image}"},
+                ],
             }
-        ]
+        ],
     )
     raw = response.choices[0].message.content
     clean = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(clean)
 
-def save_to_excel(data, output_path="invoices_output.xlsx"):
-    try:
-        existing_df = pd.read_excel(output_path)
-        new_df = pd.DataFrame([data])
-        final_df = pd.concat([existing_df, new_df], ignore_index=True)
-    except FileNotFoundError:
-        final_df = pd.DataFrame([data])
-    final_df.to_excel(output_path, index=False)
-    return final_df
 
-# --- INTERFACE ---
+# ============================================================
+# ECRITURE DANS LE TEMPLATE EXCEL (préserve la mise en forme .xls)
+# ============================================================
+def get_target_sheet_name(date_str):
+    """Déduit l'onglet (mois) à partir d'une date JJ/MM/AAAA."""
+    d = parse_date(date_str)
+    if d is None:
+        return None
+    return MONTH_SHEET_MAP.get(d.month)
+
+
+def parse_date(date_str):
+    """Parse une date en plusieurs formats possibles. Retourne un datetime ou None."""
+    if not date_str:
+        return None
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt)
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+def read_block_rows(rs, start_row, end_row):
+    """Lit toutes les lignes déjà remplies d'un bloc, sous forme de liste de dicts."""
+    rows = []
+    for row in range(start_row, end_row + 1):
+        fournisseur = rs.cell_value(row, COL_FOURNISSEUR)
+        if fournisseur in (None, ""):
+            continue
+        categorie = "Divers"
+        for cat_name, col in COL_CATEGORIE.items():
+            if rs.cell_value(row, col) not in (None, ""):
+                categorie = cat_name
+                break
+        rows.append({
+            "fournisseur": fournisseur,
+            "date": rs.cell_value(row, COL_DATE),
+            "type_paiement": rs.cell_value(row, COL_TYPE_PAIEMENT),
+            "n_cheque": rs.cell_value(row, COL_N_CHEQUE),
+            "total_ht": rs.cell_value(row, COL_HT),
+            "total_tva": rs.cell_value(row, COL_TVA),
+            "total_ttc": rs.cell_value(row, COL_TTC),
+            "categorie": categorie,
+        })
+    return rows
+
+
+def insert_invoice_into_workbook(template_bytes, data):
+    """
+    Insère une facture dans le template .xls en mémoire, en conservant
+    la mise en forme d'origine. Les factures du même bloc sont triées
+    par date (les dates non reconnues sont placées à la fin).
+    Retourne (nouveaux_bytes, message_statut).
+    """
+    sheet_name = get_target_sheet_name(data["date"])
+    if sheet_name is None:
+        return template_bytes, f"❌ Impossible de déterminer le mois pour la date '{data['date']}' (ou onglet inexistant dans ce template)."
+
+    payment_type = data.get("type_paiement", "").strip().upper()
+    block_key = PAYMENT_TYPE_TO_BLOCK.get(payment_type)
+    if block_key is None:
+        return template_bytes, f"❌ Mode de paiement non reconnu : '{data.get('type_paiement')}'."
+
+    rb = xlrd.open_workbook(file_contents=template_bytes, formatting_info=True)
+    if sheet_name not in rb.sheet_names():
+        return template_bytes, f"❌ L'onglet '{sheet_name}' n'existe pas dans ce fichier."
+
+    sheet_idx = rb.sheet_names().index(sheet_name)
+    rs = rb.sheet_by_index(sheet_idx)
+
+    _, start_row, end_row = PAYMENT_BLOCKS[block_key]
+    block_size = end_row - start_row + 1
+
+    existing_rows = read_block_rows(rs, start_row, end_row)
+    if len(existing_rows) >= block_size:
+        return template_bytes, f"❌ Le bloc '{block_key}' de l'onglet '{sheet_name}' est déjà plein."
+
+    new_row = {
+        "fournisseur": data.get("fournisseur", ""),
+        "date": data.get("date", ""),
+        "type_paiement": payment_type,
+        "n_cheque": data.get("n_cheque", ""),
+        "total_ht": float(data.get("total_ht", 0) or 0),
+        "total_tva": float(data.get("total_tva", 0) or 0),
+        "total_ttc": float(data.get("total_ttc", 0) or 0),
+        "categorie": data.get("categorie", "Divers"),
+    }
+
+    all_rows = existing_rows + [new_row]
+    # Tri par date croissante ; les dates non reconnues passent à la fin, dans leur ordre d'arrivée.
+    all_rows_indexed = list(enumerate(all_rows))
+    all_rows_indexed.sort(
+        key=lambda item: (parse_date(item[1]["date"]) is None, parse_date(item[1]["date"]) or datetime.max, item[0])
+    )
+    sorted_rows = [row for _, row in all_rows_indexed]
+    new_row_position = next(i for i, (orig_i, _) in enumerate(all_rows_indexed) if orig_i == len(all_rows) - 1)
+
+    wb = xl_copy(rb)
+    ws = wb.get_sheet(sheet_idx)
+
+    for i, row_data in enumerate(sorted_rows):
+        target_row = start_row + i
+        ws.write(target_row, COL_FOURNISSEUR, row_data["fournisseur"])
+        ws.write(target_row, COL_DATE, row_data["date"])
+        ws.write(target_row, COL_TYPE_PAIEMENT, row_data["type_paiement"])
+        ws.write(target_row, COL_N_CHEQUE, row_data["n_cheque"])
+        ws.write(target_row, COL_HT, float(row_data["total_ht"] or 0))
+        ws.write(target_row, COL_TVA, float(row_data["total_tva"] or 0))
+        ws.write(target_row, COL_TTC, float(row_data["total_ttc"] or 0))
+        # On vide les 3 colonnes de catégorie avant d'écrire la bonne,
+        # sinon une ancienne valeur peut rester d'un précédent réarrangement.
+        for col in COL_CATEGORIE.values():
+            ws.write(target_row, col, "")
+        col_cat = COL_CATEGORIE.get(row_data["categorie"], COL_CATEGORIE["Divers"])
+        ws.write(target_row, col_cat, float(row_data["total_ttc"] or 0))
+
+    out = io.BytesIO()
+    wb.save(out)
+    final_row = start_row + new_row_position
+    categorie = new_row["categorie"]
+    msg = (
+        f"✅ Ajoutée dans l'onglet **{sheet_name}**, bloc **{block_key}**, "
+        f"ligne {final_row + 1} (triée par date), catégorie **{categorie}**."
+    )
+    return out.getvalue(), msg
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
 st.title("🏨 Hotel Invoice Extractor")
-st.markdown("**Automate your invoice processing with AI — upload a PDF and get structured data instantly.**")
+st.markdown("**Upload ton template Excel, puis tes factures — l'IA remplit tout automatiquement.**")
 st.divider()
+
+if "master_bytes" not in st.session_state:
+    st.session_state.master_bytes = None
+    st.session_state.master_name = None
+if "log" not in st.session_state:
+    st.session_state.log = []
+
+with st.sidebar:
+    st.subheader("📁 Ton fichier de facturation")
+    template_file = st.file_uploader("Uploade ton .xls (une seule fois)", type=["xls"])
+    # On ne (re)charge le template QUE s'il s'agit d'un nouveau fichier,
+    # sinon chaque rerun de l'app (ex: clic sur "Extraire et remplir")
+    # écraserait la progression déjà faite avec la version vierge.
+    if template_file is not None and template_file.name != st.session_state.get("uploaded_template_name"):
+        st.session_state.master_bytes = template_file.read()
+        st.session_state.master_name = template_file.name
+        st.session_state.uploaded_template_name = template_file.name
+        st.session_state.log = []  # on repart de zéro sur un nouveau template
+        st.success(f"Chargé : {template_file.name}")
+    elif st.session_state.master_bytes:
+        st.caption(f"Fichier en cours : {st.session_state.master_name}")
+
+    if st.session_state.master_bytes:
+        st.divider()
+        st.download_button(
+            "📥 Télécharger le fichier à jour",
+            data=st.session_state.master_bytes,
+            file_name=st.session_state.master_name or "facturation_mise_a_jour.xls",
+            mime="application/vnd.ms-excel",
+            use_container_width=True,
+        )
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("📄 Upload Invoice")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-
-    if uploaded_file:
-        st.success(f"✅ File uploaded: {uploaded_file.name}")
-        pdf_bytes = uploaded_file.read()
-        image_bytes = extract_image_from_pdf(pdf_bytes)
-        st.image(image_bytes, caption="Invoice Preview", use_column_width=True)
+    st.subheader("📄 Upload Invoice(s)")
+    uploaded_files = st.file_uploader(
+        "Choisis une ou plusieurs factures PDF", type="pdf", accept_multiple_files=True
+    )
 
 with col2:
-    if uploaded_file:
-        st.subheader("🤖 AI Extraction")
+    st.subheader("🤖 Extraction & remplissage")
 
-        if st.button("Extract Data", type="primary", use_container_width=True):
-            try:
-                with st.spinner("AI is reading your invoice..."):
-                    data = extract_invoice_data(image_bytes, API_KEY)
+    if not st.session_state.master_bytes:
+        st.info("⬅️ Uploade d'abord ton template Excel dans la barre latérale.")
+    elif not uploaded_files:
+        st.info("Uploade une facture pour commencer.")
+    else:
+        if st.button("Extraire et remplir", type="primary", use_container_width=True):
+            for f in uploaded_files:
+                with st.spinner(f"Lecture de {f.name}..."):
+                    try:
+                        pdf_bytes = f.read()
+                        image_bytes = extract_image_from_pdf(pdf_bytes)
+                        data = extract_invoice_data(image_bytes, API_KEY)
+                        new_bytes, msg = insert_invoice_into_workbook(
+                            st.session_state.master_bytes, data
+                        )
+                        st.session_state.master_bytes = new_bytes
+                        st.session_state.log.append({"fichier": f.name, "data": data, "statut": msg})
+                    except Exception as e:
+                        st.session_state.log.append(
+                            {"fichier": f.name, "data": None, "statut": f"❌ Erreur : {e}"}
+                        )
 
-                st.success("✅ Data extracted successfully!")
-                st.divider()
-
-                # Metrics
-                st.subheader("💰 Invoice Summary")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Total HT", f"{data['total_ht']}€")
-                m2.metric("TVA", f"{data['total_tva']}€")
-                m3.metric("Total TTC", f"{data['total_ttc']}€")
-
-                st.divider()
-
-                # Details
-                st.subheader("📋 Invoice Details")
-                st.write(f"**Invoice Number :** {data['invoice_number']}")
-                st.write(f"**Date :** {data['date']}")
-                st.write(f"**Supplier :** {data['supplier']}")
-
-                # Save to Excel
-                df = save_to_excel(data)
-                st.divider()
-
-                # Table
-                st.subheader("📊 All Invoices")
-                st.dataframe(df, use_container_width=True)
-
-                # Download
-                with open("invoices_output.xlsx", "rb") as f:
-                    st.download_button(
-                        label="📥 Download Excel Report",
-                        data=f.read(),
-                        file_name="invoices_report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
+        if st.session_state.log:
+            st.divider()
+            for entry in reversed(st.session_state.log):
+                st.markdown(f"**{entry['fichier']}**")
+                st.write(entry["statut"])
+                if entry["data"]:
+                    d = entry["data"]
+                    st.caption(
+                        f"{d.get('fournisseur','?')} — {d.get('date','?')} — "
+                        f"{d.get('total_ttc','?')}€ TTC — {d.get('categorie','?')}"
                     )
+                st.divider()
 
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                st.info("Please check your API key and try again.")
+            st.download_button(
+                "📥 Télécharger le fichier mis à jour",
+                data=st.session_state.master_bytes,
+                file_name=st.session_state.master_name or "facturation_mise_a_jour.xls",
+                mime="application/vnd.ms-excel",
+                use_container_width=True,
+                key="download_bottom",
+            )
