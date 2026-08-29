@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from mistralai.client import Mistral
 import xlrd
+import xlwt
 from xlutils.copy import copy as xl_copy
 
 # ============================================================
@@ -22,8 +23,8 @@ API_KEY = st.secrets["MISTRAL_API_KEY"]
 
 # Onglets disponibles dans le template (noms exacts des feuilles Excel)
 MONTH_SHEET_MAP = {
-    1: None,       # Janvier - pas d'onglet dans ce template
-    2: None,       # Février - pas d'onglet dans ce template
+    1: "Jan",
+    2: "Fev",
     3: "Mars",
     4: "Avril",
     5: "Mai",
@@ -70,6 +71,50 @@ COL_HT = 5
 COL_TVA = 6
 COL_TTC = 7
 COL_CATEGORIE = {"Restaurant": 8, "Salaire": 9, "Divers": 10}
+
+# Tableau récapitulatif en bas de chaque onglet (0-indexé) :
+# ligne des libellés (Restaurant/TVA Resto/.../TVA), ligne des marqueurs (oui/cheque/cb/...),
+# et ligne où écrire les totaux calculés par formule.
+SUMMARY_MARKER_ROW = 102
+SUMMARY_TOTAL_ROW = 103
+# Plage de données couverte par les totaux (englobe les 3 blocs de paiement,
+# en incluant sans risque les lignes d'en-tête de bloc qui ne contiennent pas "OUI"/"CB" etc.)
+SUMMARY_DATA_START = 2
+SUMMARY_DATA_END = 98
+
+
+def _excel_range(col_letter, start_row_0idx, end_row_0idx):
+    """Construit une référence de plage Excel du type 'I3:I99' à partir d'index 0-based."""
+    return f"{col_letter}{start_row_0idx + 1}:{col_letter}{end_row_0idx + 1}"
+
+
+def write_summary_formulas(ws):
+    """
+    Écrit les formules SOMME.SI / SOMME dans la ligne de totaux du tableau
+    récapitulatif (Restaurant, TVA Resto, Salaire, Divers, Cheques, CB,
+    PRELEVEMENT, ESP, TVA), en se basant sur les marqueurs de la ligne au-dessus.
+    """
+    rng_I = _excel_range("I", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    rng_J = _excel_range("J", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    rng_K = _excel_range("K", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    rng_D = _excel_range("D", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    rng_G = _excel_range("G", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    rng_H = _excel_range("H", SUMMARY_DATA_START, SUMMARY_DATA_END)
+    mr = SUMMARY_MARKER_ROW + 1  # numéro de ligne Excel (1-indexé) pour les marqueurs
+
+    formulas = {
+        2: f"SUMIF({rng_I},C{mr},{rng_H})",   # Restaurant
+        3: f"SUMIF({rng_I},D{mr},{rng_G})",   # TVA Resto
+        4: f"SUMIF({rng_J},E{mr},{rng_H})",   # Salaire
+        5: f"SUMIF({rng_K},F{mr},{rng_H})",   # Divers
+        6: f"SUMIF({rng_D},G{mr},{rng_H})",   # Cheques
+        7: f"SUMIF({rng_D},H{mr},{rng_H})",   # CB
+        8: f"SUMIF({rng_D},I{mr},{rng_H})",   # PRELEVEMENT
+        9: f"SUMIF({rng_D},J{mr},{rng_H})",   # ESP
+        10: f"SUM({rng_G})",                   # TVA
+    }
+    for col, formula in formulas.items():
+        ws.write(SUMMARY_TOTAL_ROW, col, xlwt.Formula(formula))
 
 
 # ============================================================
@@ -311,6 +356,8 @@ def insert_invoice_into_workbook(template_bytes, data):
         # OUI uniquement dans la bonne colonne de catégorie, rien dans les deux autres.
         for cat_name, col in COL_CATEGORIE.items():
             ws.write(target_row, col, "OUI" if cat_name == row_data["categorie"] else "")
+
+    write_summary_formulas(ws)
 
     out = io.BytesIO()
     wb.save(out)
