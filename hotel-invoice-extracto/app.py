@@ -159,7 +159,8 @@ def read_block_rows(rs, start_row, end_row):
             continue
         categorie = "Divers"
         for cat_name, col in COL_CATEGORIE.items():
-            if rs.cell_value(row, col) not in (None, ""):
+            cell_val = str(rs.cell_value(row, col)).strip().upper()
+            if cell_val == "OUI":
                 categorie = cat_name
                 break
         rows.append({
@@ -237,12 +238,9 @@ def insert_invoice_into_workbook(template_bytes, data):
         ws.write(target_row, COL_HT, float(row_data["total_ht"] or 0))
         ws.write(target_row, COL_TVA, float(row_data["total_tva"] or 0))
         ws.write(target_row, COL_TTC, float(row_data["total_ttc"] or 0))
-        # On vide les 3 colonnes de catégorie avant d'écrire la bonne,
-        # sinon une ancienne valeur peut rester d'un précédent réarrangement.
-        for col in COL_CATEGORIE.values():
-            ws.write(target_row, col, "")
-        col_cat = COL_CATEGORIE.get(row_data["categorie"], COL_CATEGORIE["Divers"])
-        ws.write(target_row, col_cat, float(row_data["total_ttc"] or 0))
+        # OUI dans la bonne colonne de catégorie, NON dans les deux autres.
+        for cat_name, col in COL_CATEGORIE.items():
+            ws.write(target_row, col, "OUI" if cat_name == row_data["categorie"] else "NON")
 
     out = io.BytesIO()
     wb.save(out)
