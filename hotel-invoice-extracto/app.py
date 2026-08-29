@@ -238,9 +238,9 @@ def insert_invoice_into_workbook(template_bytes, data):
         ws.write(target_row, COL_HT, float(row_data["total_ht"] or 0))
         ws.write(target_row, COL_TVA, float(row_data["total_tva"] or 0))
         ws.write(target_row, COL_TTC, float(row_data["total_ttc"] or 0))
-        # OUI dans la bonne colonne de catégorie, NON dans les deux autres.
+        # OUI uniquement dans la bonne colonne de catégorie, rien dans les deux autres.
         for cat_name, col in COL_CATEGORIE.items():
-            ws.write(target_row, col, "OUI" if cat_name == row_data["categorie"] else "NON")
+            ws.write(target_row, col, "OUI" if cat_name == row_data["categorie"] else "")
 
     out = io.BytesIO()
     wb.save(out)
